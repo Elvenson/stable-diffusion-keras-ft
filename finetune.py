@@ -1,11 +1,13 @@
 """
 Adapted from  https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
-
+and from https://github.com/huggingface/diffusers/pull/1884/files
+and from https://github.com/keras-team/keras-io/pull/1388/files
 # Usage
 python finetune.py
 """
-import json
 import warnings
+
+from keras_cv.models.stable_diffusion.stable_diffusion import MAX_PROMPT_LENGTH
 
 warnings.filterwarnings("ignore")
 
@@ -24,7 +26,7 @@ from tensorflow.keras import mixed_precision
 from datasets import DatasetUtils
 from trainer import Trainer
 
-MAX_PROMPT_LENGTH = 77
+CKPT_PREFIX = "ckpt"
 
 
 def parse_args():
@@ -33,24 +35,27 @@ def parse_args():
     )
     # Dataset related.
     parser.add_argument("--dataset_archive", default=None, type=str)
-    parser.add_argument("--img_height", default=256, type=int)
-    parser.add_argument("--img_width", default=256, type=int)
-    parser.add_argument("--log_dir", type=str)
-    parser.add_argument("--augmentation", type=bool, default=False)
+    parser.add_argument("--img_height", default=512, type=int)
+    parser.add_argument("--img_width", default=512, type=int)
+    parser.add_argument("--augmentation", action="store_true", help="Whether to do data augmentation.")
 
     # Optimization hyperparameters.
     parser.add_argument("--lr", default=1e-5, type=float)
+    parser.add_argument("--decay_steps", default=800, type=int)
+    parser.add_argument("--alpha", default=0.1, type=float)
     parser.add_argument("--wd", default=1e-2, type=float)
     parser.add_argument("--beta_1", default=0.9, type=float)
     parser.add_argument("--beta_2", default=0.999, type=float)
     parser.add_argument("--epsilon", default=1e-08, type=float)
     parser.add_argument("--ema", default=0.9999, type=float)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
-    parser.add_argument("--exp_signature", type=str, help="Experiment signature")
 
     # Training hyperparameters.
-    parser.add_argument("--batch_size", default=4, type=int)
-    parser.add_argument("--num_epochs", default=100, type=int)
+    parser.add_argument("--batch_size", default=1, type=int)
+    parser.add_argument("--num_epochs", default=70, type=int)
+    parser.add_argument("--lora", action="store_true", help="Whether to load loRA layer.")
+    parser.add_argument("--lora_rank", default=4, type=int)
+    parser.add_argument("--lora_alpha", default=4, type=float)
 
     # Others.
     parser.add_argument(
@@ -75,14 +80,6 @@ def run(args):
         assert policy.compute_dtype == "float16"
         assert policy.variable_dtype == "float32"
 
-    print("Fetch data from HDFS")
-    os.system("hdfs dfs -get {}/{} .".format(args.log_dir, args.dataset_archive))
-
-    print("Saving config...")
-    config = json.dumps(args.__dict__)
-    with tf.io.gfile.GFile(os.path.join(args.log_dir, args.exp_signature, 'config.json'), 'w') as f:
-        f.write(config)
-
     print("Initializing dataset...")
     data_utils = DatasetUtils(
         dataset_archive=args.dataset_archive,
@@ -93,11 +90,18 @@ def run(args):
     training_dataset = data_utils.prepare_dataset(augmentation=args.augmentation)
 
     print("Initializing trainer...")
+    ckpt_path = (
+            CKPT_PREFIX
+            + f"_epochs_{args.num_epochs}"
+            + f"_res_{args.img_height}"
+            + f"_mp_{args.mp}"
+            + ".h5"
+    )
     image_encoder = ImageEncoder(args.img_height, args.img_width)
 
     diffusion_ft_trainer = Trainer(
         diffusion_model=DiffusionModel(
-            args.img_height, args.img_width, MAX_PROMPT_LENGTH
+            args.img_height, args.img_width, MAX_PROMPT_LENGTH,
         ),
         # Remove the top layer from the encoder, which cuts off the variance and only returns
         # the mean
@@ -110,18 +114,16 @@ def run(args):
         mp=args.mp,
         ema=args.ema,
         max_grad_norm=args.max_grad_norm,
+        lora=args.lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
     )
 
-    checkpoint_path = os.path.join(args.log_dir, args.exp_signature, "checkpoint")
-    if tf.io.gfile.exists(checkpoint_path):
-        print("Found existing checkpoints, begin loading checkpoint")
-        latest = tf.train.latest_checkpoint(checkpoint_path)
-        print("Latest checkpoint is {}".format(latest))
-        diffusion_ft_trainer.diffusion_model.load_weights(latest)
-
     print("Initializing optimizer...")
+    lr_decayed_fn = tf.keras.optimizers.schedules.CosineDecay(
+        args.lr, decay_steps=args.decay_steps, alpha=args.alpha)
     optimizer = tf.keras.optimizers.experimental.AdamW(
-        learning_rate=args.lr,
+        learning_rate=lr_decayed_fn,
         weight_decay=args.wd,
         beta_1=args.beta_1,
         beta_2=args.beta_2,
@@ -135,20 +137,15 @@ def run(args):
 
     print("Training...")
     ckpt_callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=os.path.join(args.log_dir, args.exp_signature, "checkpoint", "cp-{epoch:04d}.ckpt"),
+        ckpt_path,
         save_weights_only=True,
         monitor="loss",
         mode="min",
     )
-    train_tensorboard_callback = tf.keras.callbacks.TensorBoard(
-        log_dir=os.path.join(args.log_dir, args.exp_signature),
-        histogram_freq=1,
-        profile_batch='500,520'
-    )
     diffusion_ft_trainer.fit(
         training_dataset,
         epochs=args.num_epochs,
-        callbacks=[ckpt_callback, train_tensorboard_callback]
+        callbacks=[ckpt_callback]
     )
 
 

@@ -1,25 +1,129 @@
+from typing import Union
+
 import tensorflow as tf
 import tensorflow.experimental.numpy as tnp
 from keras_cv.models.stable_diffusion.noise_scheduler import NoiseScheduler
+from keras_cv.models.stable_diffusion.stable_diffusion import MAX_PROMPT_LENGTH
 from tensorflow import keras
 
+from layers import LoraLayer
 
+
+def load_sd_lora_layer(
+        diffusion_model: tf.keras.Model,
+        img_height: int,
+        img_width: int,
+        rank: int,
+        alpha: float,
+):
+    for l in diffusion_model.layers:
+        if "spatial_transformer" in l.name:
+            l.transformer_block.attn1.to_q = LoraLayer(
+                l.transformer_block.attn1.to_q,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+            l.transformer_block.attn1.to_k = LoraLayer(
+                l.transformer_block.attn1.to_k,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+            l.transformer_block.attn1.to_v = LoraLayer(
+                l.transformer_block.attn1.to_v,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+            l.transformer_block.attn1.out_proj = LoraLayer(
+                l.transformer_block.attn1.out_proj,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+
+            l.transformer_block.attn2.to_q = LoraLayer(
+                l.transformer_block.attn2.to_q,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+            l.transformer_block.attn2.to_k = LoraLayer(
+                l.transformer_block.attn2.to_k,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+            l.transformer_block.attn2.to_v = LoraLayer(
+                l.transformer_block.attn2.to_v,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+            l.transformer_block.attn2.out_proj = LoraLayer(
+                l.transformer_block.attn2.out_proj,
+                rank=rank,
+                alpha=alpha,
+                use_bias=False,
+                trainable=True
+            )
+
+    # Forward pass to register new LoRA layers.
+    latent = tf.random.normal([1, img_height // 8, img_width // 8, 4], 0, 1)
+    t_emb = tf.random.normal([1, 320], 0, 1)
+    context = tf.random.normal([1, MAX_PROMPT_LENGTH, 768], 0, 1)
+    diffusion_model.predict_on_batch([latent, t_emb, context])
+
+    # Freeze all layers except LoRA layers.
+    for layer in diffusion_model._flatten_layers():
+        lst_of_sublayers = list(layer._flatten_layers())
+
+        if len(lst_of_sublayers) == 1:  # "leaves of the model"
+            if layer.name in ["lora_a", "lora_b"]:
+                layer.trainable = True
+            else:
+                layer.trainable = False
+
+
+# Load LoRA layer for Stable Diffusion model
 class Trainer(tf.keras.Model):
     # Adapted from https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
 
     def __init__(
-        self,
-        diffusion_model: tf.keras.Model,
-        vae: tf.keras.Model,
-        noise_scheduler: NoiseScheduler,
-        pretrained_ckpt: str,
-        mp: bool,
-        ema=0.9999,
-        max_grad_norm=1.0,
-        **kwargs,
+            self,
+            diffusion_model: tf.keras.Model,
+            vae: tf.keras.Model,
+            noise_scheduler: NoiseScheduler,
+            pretrained_ckpt: Union[str, None],
+            mp: bool,
+            ema=0.9999,
+            max_grad_norm=1.0,
+            lora=False,
+            lora_rank=4,
+            lora_alpha=4.,
+            **kwargs,
     ):
         super().__init__(**kwargs)
+
+        if lora and ema > 0.0:
+            raise ValueError(
+                "LoRA layer does not support exponential moving averaging learning (ema) for now."
+            )
+
         self.diffusion_model = diffusion_model
+
+        if lora:
+            load_sd_lora_layer(self.diffusion_model, vae.input_shape[1], vae.input_shape[2],
+                               rank=lora_rank, alpha=lora_alpha)
+
         if pretrained_ckpt is not None:
             self.diffusion_model.load_weights(pretrained_ckpt)
             print(
@@ -29,6 +133,10 @@ class Trainer(tf.keras.Model):
         self.vae = vae
         self.noise_scheduler = noise_scheduler
 
+        self.vae.trainable = False
+        self.mp = mp
+        self.max_grad_norm = max_grad_norm
+
         if ema > 0.0:
             self.ema = tf.Variable(ema, dtype="float32")
             self.optimization_step = tf.Variable(0, dtype="int32")
@@ -36,10 +144,6 @@ class Trainer(tf.keras.Model):
             self.do_ema = True
         else:
             self.do_ema = False
-
-        self.vae.trainable = False
-        self.mp = mp
-        self.max_grad_norm = max_grad_norm
 
     def train_step(self, inputs):
         images = inputs["images"]
@@ -51,16 +155,16 @@ class Trainer(tf.keras.Model):
             latents = self.sample_from_encoder_outputs(self.vae(images, training=False))
             latents = latents * 0.18215
 
-            # Sample noise that we'll add to the latents
+            # Sample noise that we'll add to the latents.
             noise = tf.random.normal(tf.shape(latents))
 
-            # Sample a random timestep for each image
+            # Sample a random timestep for each image.
             timesteps = tnp.random.randint(
                 0, self.noise_scheduler.train_timesteps, (bsz,)
             )
 
             # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
+            # (this is the forward diffusion process).
             noisy_latents = self.noise_scheduler.add_noise(
                 tf.cast(latents, noise.dtype), noise, timesteps
             )
@@ -123,8 +227,8 @@ class Trainer(tf.keras.Model):
         self.ema.assign(self.get_decay(self.optimization_step))
 
         for weight, ema_weight in zip(
-            self.diffusion_model.trainable_variables,
-            self.ema_diffusion_model.trainable_variables,
+                self.diffusion_model.trainable_variables,
+                self.ema_diffusion_model.trainable_variables,
         ):
             tmp = self.ema * (ema_weight - weight)
             ema_weight.assign_sub(tmp)

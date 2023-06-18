@@ -43,13 +43,11 @@ class DatasetUtils:
 
         if dataset_archive is None:
             dataset_archive = DEFAULT_DATA_ARCHIVE
-
         data_path = tf.keras.utils.get_file(
-            origin="file://" + os.path.abspath('') + "/" + dataset_archive,
+            origin=dataset_archive,
             untar=True,
         )
-
-        self.data_frame = pd.read_csv(os.path.join(data_path, "data.csv"), sep="\t")
+        self.data_frame = pd.read_csv(os.path.join(data_path, "data.csv"))
         self.data_frame["image_path"] = self.data_frame["image_path"].apply(
             lambda x: os.path.join(data_path, x)
         )
